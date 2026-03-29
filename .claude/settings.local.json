@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git remote:*)",
+      "Bash(git push:*)",
+      "Bash(git -C /Users/user ls-files)",
+      "Bash(git -C /Users/user log --oneline)",
+      "Bash(git -C /Users/user show --stat HEAD)",
+      "Bash(git init:*)",
+      "Bash(git -C /Users/user/projects/desearch-dashboard remote add origin https://github.com/cozeflannel/xdeepsearch.git)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
+    ]
+  }
+}
