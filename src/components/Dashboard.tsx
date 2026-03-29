@@ -17,8 +17,9 @@ import AnimatedBackground from '@/components/AnimatedBackground'
 import SearchResultsFeed from '@/components/SearchResultsFeed'
 import TweetCard from '@/components/TweetCard'
 import UserCard from '@/components/UserCard'
-import InsightsPanel from '@/components/InsightsPanel'
-import TrendsPanel from '@/components/TrendsPanel'
+import { AIInsights } from '@/components/InsightsPanel'
+import InsightsDrawer from '@/components/InsightsDrawer'
+import UserProfileModal from '@/components/UserProfileModal'
 
 export type ScoredTweet = Tweet & { sentiment: TweetSentiment }
 
@@ -86,6 +87,24 @@ export default function Dashboard() {
   const [singlePost, setSinglePost] = useState<Tweet | null>(null)
   const [postError, setPostError] = useState<string | null>(null)
 
+  // AI insights
+  const [aiInsights, setAiInsights] = useState<AIInsights | null>(null)
+  const [aiInsightsLoading, setAiInsightsLoading] = useState(false)
+  const [aiInsightsError, setAiInsightsError] = useState<string | null>(null)
+
+  // AI tweet summaries — keyed by tweet ID
+  const [tweetSummaries, setTweetSummaries] = useState<Record<string, string>>({})
+
+  // Enhanced query shown after search
+  const [enhancedQuery, setEnhancedQuery] = useState<string | null>(null)
+
+  // User profile modal
+  const [modalUser, setModalUser] = useState<User | null>(null)
+
+  // Insights drawer
+  const [drawerOpen, setDrawerOpen] = useState(false)
+  const drawerToggleRef = useRef<HTMLButtonElement>(null)
+
   // Search query ref — used to ignore stale responses
   const activeSearchQueryRef = useRef<string>('')
 
@@ -103,25 +122,106 @@ export default function Dashboard() {
     }
   }, [])
 
+  // AI INSIGHTS — fire after search results arrive
+  const fetchInsights = useCallback(async (
+    query: string,
+    scored: ScoredTweet[]
+  ) => {
+    setAiInsights(null)
+    setAiInsightsLoading(true)
+    setAiInsightsError(null)
+    try {
+      const sentimentSummary = analyzeOverall(scored)
+      const res = await fetch('/api/ai/insights', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          tweets: scored.map((t) => ({
+            id: t.id,
+            text: t.text,
+            like_count: t.like_count,
+            retweet_count: t.retweet_count,
+            reply_count: t.reply_count,
+            user: { username: t.user?.username, followers_count: t.user?.followers_count ?? null },
+            sentiment: t.sentiment,
+          })),
+          searchQuery: query,
+          sentimentSummary,
+        }),
+      })
+      const data = await res.json()
+      if (!res.ok || data.error) {
+        setAiInsightsError(data.error || 'AI analysis failed')
+      } else {
+        setAiInsights(data as AIInsights)
+      }
+    } catch {
+      setAiInsightsError('AI analysis failed — check your ANTHROPIC_API_KEY')
+    } finally {
+      setAiInsightsLoading(false)
+    }
+  }, [])
+
+  // TWEET SUMMARIES — fire after search results arrive
+  const fetchTweetSummaries = useCallback(async (tweets: Tweet[]) => {
+    try {
+      const res = await fetch('/api/ai/tweet-summaries', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          tweets: tweets.slice(0, 30).map((t) => ({ id: t.id, text: t.text })),
+        }),
+      })
+      if (res.ok) {
+        const data = await res.json()
+        if (!data.error) setTweetSummaries(data as Record<string, string>)
+      }
+    } catch {
+      // Summaries are supplementary — fail silently
+    }
+  }, [])
+
   // SEARCH
   const doSearch = useCallback(async () => {
-    const query = state.searchQuery.trim()
-    if (!query) return
+    const rawQuery = state.searchQuery.trim()
+    if (!rawQuery) return
 
     // Mark this query as active
-    activeSearchQueryRef.current = query
-    setLastSearchQuery(query)
+    activeSearchQueryRef.current = rawQuery
+    setLastSearchQuery(rawQuery)
 
-    // Clear old results immediately so the panel knows to show loading
+    // Clear old results and AI state
     setSearchResults([])
     setSearchError(null)
+    setEnhancedQuery(null)
+    setAiInsights(null)
+    setTweetSummaries({})
     setLoading((l) => ({ ...l, search: true }))
+
+    // Enhance query (best-effort — don't block on failure)
+    let queryToUse = rawQuery
+    try {
+      const enhRes = await fetch('/api/ai/enhance-query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: rawQuery }),
+      })
+      if (enhRes.ok) {
+        const enhData = await enhRes.json()
+        if (enhData.enhanced && enhData.enhanced !== rawQuery) {
+          queryToUse = enhData.enhanced
+          setEnhancedQuery(enhData.enhanced)
+        }
+      }
+    } catch {
+      // Enhancement failed silently
+    }
 
     try {
       const hasUsername = state.username.trim().length > 0
       let endpoint = '/api/desearch/x'
       const body: Record<string, unknown> = {
-        query,
+        query: queryToUse,
         sort: state.sort,
         count: state.resultCount,
         startDate: state.startDate || undefined,
@@ -140,7 +240,7 @@ export default function Dashboard() {
       if (hasUsername) {
         endpoint = '/api/desearch/x_user'
         body.user = state.username
-        body.query = query
+        body.query = queryToUse
       }
 
       const res = await fetch(endpoint, {
@@ -151,7 +251,7 @@ export default function Dashboard() {
       const data = await res.json()
 
       // Ignore if this search has been superseded by a newer one
-      if (activeSearchQueryRef.current !== query) return
+      if (activeSearchQueryRef.current !== rawQuery) return
 
       if (!res.ok || isApiError(data)) {
         handleApiError(data, setSearchError)
@@ -160,34 +260,34 @@ export default function Dashboard() {
       }
 
       if (isValidSearchResult(data)) {
-        // Score each tweet with sentiment
         const scored = data.map((tweet: Tweet) => ({
           ...tweet,
           sentiment: analyzeTweet(tweet.text),
         })) as ScoredTweet[]
 
-        // Apply sentiment filter if set
-        const filtered = state.sentimentFilter === 'all'
-          ? scored
-          : scored.filter((t) => t.sentiment.classification === state.sentimentFilter)
-
         setSearchResults(data)
         setScoredTweets(scored)
+
+        // Fire AI calls asynchronously — don't await, they update state independently
+        if (activeSearchQueryRef.current === rawQuery) {
+          fetchInsights(rawQuery, scored)
+          fetchTweetSummaries(data)
+        }
       } else {
         setSearchResults([])
         setScoredTweets([])
         setSearchError('No results found for this query.')
       }
     } catch (err) {
-      if (activeSearchQueryRef.current !== query) return
+      if (activeSearchQueryRef.current !== rawQuery) return
       handleApiError(err, setSearchError)
       setSearchResults([])
     } finally {
-      if (activeSearchQueryRef.current === query) {
+      if (activeSearchQueryRef.current === rawQuery) {
         setLoading((l) => ({ ...l, search: false }))
       }
     }
-  }, [state, handleApiError])
+  }, [state, handleApiError, fetchInsights, fetchTweetSummaries])
 
   // Re-filter scored tweets when sentiment filter changes
   const [filteredScoredTweets, setFilteredScoredTweets] = useState<ScoredTweet[]>([])
@@ -207,8 +307,8 @@ export default function Dashboard() {
   }, [scoredTweets, state.sentimentFilter])
 
   // TIMELINE
-  const doLoadTimeline = useCallback(async () => {
-    const username = state.username.trim()
+  const doLoadTimeline = useCallback(async (usernameOverride?: string) => {
+    const username = (usernameOverride ?? state.username).trim()
     if (!username) return
     setLoading((l) => ({ ...l, timeline: true }))
     setTimelineError(null)
@@ -311,8 +411,8 @@ export default function Dashboard() {
   }, [state.postIdUrl, handleApiError])
 
   // FETCH POST
-  const doFetchPost = useCallback(async () => {
-    const id = extractPostId(state.postIdUrl)
+  const doFetchPost = useCallback(async (postIdOverride?: string) => {
+    const id = postIdOverride ? extractPostId(postIdOverride) : extractPostId(state.postIdUrl)
     if (!id) return
     setLoading((l) => ({ ...l, post: true }))
     setPostError(null)
@@ -376,47 +476,18 @@ export default function Dashboard() {
   // Click handlers
   const handleUsernameClick = useCallback((username: string) => {
     setState((prev) => ({ ...prev, username }))
-    // Auto-load timeline for clicked username
-    setTimeout(() => {
-      setLoading((l) => ({ ...l, timeline: true }))
-      setTimelineError(null)
-      fetch('/api/desearch/x_timeline', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, count: state.resultCount }),
-      })
-        .then((r) => r.json())
-        .then((data) => {
-          if (!isApiError(data) && isTimelineResponse(data)) {
-            setTimelineData(data)
-          }
-        })
-        .catch(() => setTimelineError('Request failed. Check connection and retry.'))
-        .finally(() => setLoading((l) => ({ ...l, timeline: false })))
-    }, 0)
-  }, [state.resultCount])
+    doLoadTimeline(username)
+  }, [doLoadTimeline])
 
   const handlePostIdClick = useCallback((postId: string) => {
     setState((prev) => ({ ...prev, postIdUrl: postId }))
-    setSinglePost(null)
-    setPostError(null)
-    setLoading((l) => ({ ...l, post: true }))
-    fetch('/api/desearch/x_post', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: postId }),
-    })
-      .then((r) => r.json())
-      .then((data) => {
-        if (!isApiError(data) && isSingleTweet(data)) {
-          setSinglePost(data)
-        } else if (isApiError(data)) {
-          handleApiError(data, setPostError)
-        }
-      })
-      .catch((err) => handleApiError(err, setPostError))
-      .finally(() => setLoading((l) => ({ ...l, post: false })))
-  }, [handleApiError])
+    doFetchPost(postId)
+  }, [doFetchPost])
+
+  // Opens the user profile modal with whatever data we already have from the tweet
+  const handleUserClick = useCallback((user: User) => {
+    setModalUser(user)
+  }, [])
 
   const activeLoadingEndpoint =
     loading.search ? 'search' :
@@ -438,18 +509,20 @@ export default function Dashboard() {
         onLoadRetweeters={() => doLoadRetweeters()}
         loading={!!activeLoadingEndpoint}
         activeEndpoint={activeLoadingEndpoint}
+        drawerOpen={drawerOpen}
+        onToggleDrawer={() => setDrawerOpen((o) => !o)}
+        hasInsightsData={scoredTweets.length > 0 || !!aiInsights || retweetersData.length > 0}
+        drawerToggleRef={drawerToggleRef}
       />
 
       <div className="p-4">
-        <div className="grid grid-cols-1 lg:grid-cols-[1fr_380px] gap-4">
-          {/* LEFT COLUMN */}
-          <div className="space-y-4">
-            {/* Search Results — THE MAIN PANEL */}
+        <div className="flex justify-center">
+          <div className="w-full max-w-3xl">
             <Panel
               title="Search Results"
               subtitle={
                 searchResults.length > 0
-                  ? `${searchResults.length} posts for "${lastSearchQuery}"`
+                  ? `${searchResults.length} posts for "${lastSearchQuery}"${enhancedQuery ? ` · expanded query` : ''}`
                   : state.searchQuery
                   ? `Searching for "${state.searchQuery}"...`
                   : undefined
@@ -461,6 +534,12 @@ export default function Dashboard() {
                 !state.searchQuery ? null : searchResults.length === 0 && !loading.search && !searchError ? null : undefined
               }
             >
+              {enhancedQuery && searchResults.length > 0 && (
+                <div className="px-4 py-2 border-b border-[var(--border)] text-xs text-[var(--muted)]">
+                  <span className="opacity-70">Query expanded to: </span>
+                  <span className="text-[var(--blue)]">{enhancedQuery}</span>
+                </div>
+              )}
               <SearchResultsFeed
                 tweets={filteredScoredTweets}
                 searchQuery={lastSearchQuery}
@@ -469,6 +548,8 @@ export default function Dashboard() {
                 onRetry={doSearch}
                 onUsernameClick={handleUsernameClick}
                 onPostIdClick={handlePostIdClick}
+                onUserClick={handleUserClick}
+                tweetSummaries={tweetSummaries}
                 emptyMessage={
                   !state.searchQuery
                     ? null
@@ -478,157 +559,37 @@ export default function Dashboard() {
                 }
               />
             </Panel>
-
-            {/* AI Insights — below search results */}
-            <Panel
-              title="AI Insights"
-              subtitle="Generated from loaded data"
-            >
-              <InsightsPanel
-                tweets={(scoredTweets.length > 0 ? scoredTweets : (timelineData?.tweets ?? [])) as any}
-                searchQuery={lastSearchQuery || state.searchQuery}
-                onUsernameClick={handleUsernameClick}
-                onPostIdClick={handlePostIdClick}
-              />
-            </Panel>
-          </div>
-
-          {/* RIGHT COLUMN */}
-          <div className="space-y-4">
-            {/* User Profile Card */}
-            <Panel
-              title="User Profile"
-              loading={loading.timeline}
-              error={timelineError}
-              onRetry={doLoadTimeline}
-              emptyMessage={state.username ? undefined : 'Enter a username to load profile'}
-            >
-              {timelineData?.user ? (
-                <UserCard
-                  user={timelineData.user}
-                  onUsernameClick={handleUsernameClick}
-                />
-              ) : null}
-            </Panel>
-
-            {/* User Timeline / Replies */}
-            <Panel
-              title={activeTab === 'timeline' ? 'User Timeline' : 'User Replies'}
-              loading={activeTab === 'timeline' ? loading.timeline : loading.replies}
-              error={activeTab === 'timeline' ? timelineError : repliesError}
-              emptyMessage={state.username ? undefined : 'Load a timeline to see posts'}
-              action={
-                state.username ? (
-                  <div className="flex gap-1">
-                    <button
-                      onClick={() => { setActiveTab('timeline'); if (!timelineData) doLoadTimeline() }}
-                      className={`px-2 py-1 text-xs rounded transition-colors ${
-                        activeTab === 'timeline' ? 'bg-[#1d9bf0] text-white' : 'text-[var(--muted)] hover:text-[var(--text)]'
-                      }`}
-                    >
-                      Timeline
-                    </button>
-                    <button
-                      onClick={() => { setActiveTab('replies'); if (!repliesData.length) doLoadReplies() }}
-                      className={`px-2 py-1 text-xs rounded transition-colors ${
-                        activeTab === 'replies' ? 'bg-[#1d9bf0] text-white' : 'text-[var(--muted)] hover:text-[var(--text)]'
-                      }`}
-                    >
-                      Replies
-                    </button>
-                  </div>
-                ) : null
-              }
-            >
-              <div>
-                {activeTab === 'timeline' && timelineData?.tweets?.map((tweet) => (
-                  <TweetCard
-                    key={tweet.id}
-                    tweet={tweet}
-                    onUsernameClick={handleUsernameClick}
-                    onPostIdClick={handlePostIdClick}
-                  />
-                ))}
-                {activeTab === 'replies' && repliesData.map((tweet) => (
-                  <div key={tweet.id}>
-                    {tweet.in_reply_to_screen_name && (
-                      <div className="px-4 py-1.5 text-xs text-[var(--muted)] border-b border-[#262626]">
-                        Replying to{' '}
-                        <button
-                          className="text-[#1d9bf0] hover:underline"
-                          onClick={() => handleUsernameClick(tweet.in_reply_to_screen_name!)}
-                        >
-                          @{tweet.in_reply_to_screen_name}
-                        </button>
-                      </div>
-                    )}
-                    <TweetCard
-                      tweet={tweet}
-                      onUsernameClick={handleUsernameClick}
-                      onPostIdClick={handlePostIdClick}
-                    />
-                  </div>
-                ))}
-                {!state.username && (
-                  <div className="flex items-center justify-center h-24 text-[var(--muted)] text-sm">
-                    Enter a username to load
-                  </div>
-                )}
-              </div>
-            </Panel>
-
-            {/* Retweeters */}
-            <Panel
-              title="Retweeters"
-              loading={loading.retweeters}
-              error={retweetersError}
-              onRetry={() => doLoadRetweeters()}
-              emptyMessage={state.postIdUrl ? undefined : 'Enter a post ID to see retweeters'}
-            >
-              <div>
-                {retweetersData.map((user) => (
-                  <UserCard
-                    key={user.id}
-                    user={user}
-                    compact
-                    onUsernameClick={handleUsernameClick}
-                  />
-                ))}
-                {retweetersCursor && (
-                  <button
-                    onClick={() => doLoadRetweeters(undefined, retweetersCursor ?? undefined)}
-                    disabled={loadingMore}
-                    className="w-full py-3 text-sm text-[#1d9bf0] hover:bg-[#1d9bf0]/10 transition-colors disabled:opacity-50"
-                  >
-                    {loadingMore ? 'Loading...' : 'Load More'}
-                  </button>
-                )}
-                {!retweetersCursor && retweetersData.length > 0 && (
-                  <div className="py-2 text-center text-xs text-[var(--muted)]">
-                    All retweeters loaded
-                  </div>
-                )}
-                {!state.postIdUrl && (
-                  <div className="flex items-center justify-center h-24 text-[var(--muted)] text-sm">
-                    Enter a post ID to load
-                  </div>
-                )}
-              </div>
-            </Panel>
-
-            {/* Trends + Word Cloud */}
-            <Panel
-              title="Trends & Word Cloud"
-              subtitle={searchResults.length > 0 ? `${scoredTweets.length} posts analyzed` : undefined}
-            >
-              <TrendsPanel
-                tweets={scoredTweets.length > 0 ? scoredTweets : []}
-                searchQuery={lastSearchQuery}
-              />
-            </Panel>
           </div>
         </div>
       </div>
+
+      {/* Insights slide-over drawer */}
+      <InsightsDrawer
+        open={drawerOpen}
+        onClose={() => setDrawerOpen(false)}
+        toggleButtonRef={drawerToggleRef}
+        scoredTweets={scoredTweets}
+        searchQuery={lastSearchQuery}
+        aiInsights={aiInsights}
+        aiInsightsLoading={aiInsightsLoading}
+        aiInsightsError={aiInsightsError}
+        retweetersData={retweetersData}
+        retweetersError={retweetersError}
+        retweetersCursor={retweetersCursor}
+        loadingMore={loadingMore}
+        loadingRetweeters={loading.retweeters}
+        onLoadMoreRetweeters={() => doLoadRetweeters(undefined, retweetersCursor ?? undefined)}
+        onUsernameClick={handleUsernameClick}
+      />
+
+      {/* User profile modal */}
+      {modalUser && (
+        <UserProfileModal
+          user={modalUser}
+          onClose={() => setModalUser(null)}
+          onViewTimeline={() => setModalUser(null)}
+        />
+      )}
     </div>
   )
 }

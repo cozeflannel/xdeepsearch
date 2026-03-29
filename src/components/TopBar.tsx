@@ -1,7 +1,7 @@
 'use client'
 
 import { useState } from 'react'
-import { Search, User, Hash, Loader2, Sun, Moon, SlidersHorizontal, ArrowRight } from 'lucide-react'
+import { Search, User, Hash, Loader2, Sun, Moon, SlidersHorizontal, ArrowRight, Sparkles, X } from 'lucide-react'
 import { DashboardState } from '@/types'
 import { useTheme } from './ThemeProvider'
 
@@ -15,6 +15,10 @@ interface TopBarProps {
   onLoadRetweeters: () => void
   loading: boolean
   activeEndpoint: string | null
+  drawerOpen: boolean
+  onToggleDrawer: () => void
+  hasInsightsData: boolean
+  drawerToggleRef: React.RefObject<HTMLButtonElement | null>
 }
 
 const LANGUAGES = [
@@ -45,6 +49,10 @@ export default function TopBar({
   onLoadRetweeters,
   loading,
   activeEndpoint,
+  drawerOpen,
+  onToggleDrawer,
+  hasInsightsData,
+  drawerToggleRef,
 }: TopBarProps) {
   const [showFilters, setShowFilters] = useState(false)
   const { theme, toggleTheme } = useTheme()
@@ -224,6 +232,32 @@ export default function TopBar({
                 <ArrowRight className="w-4 h-4" />
               )}
               {getActionLabel()}
+            </button>
+          </div>
+
+          {/* Insights drawer toggle */}
+          <div>
+            <label className={labelClass} style={{ opacity: 0 }}>Insights</label>
+            <button
+              ref={drawerToggleRef}
+              onClick={onToggleDrawer}
+              className="relative flex items-center gap-1.5 px-3 py-2 text-sm font-medium rounded-lg border transition-colors whitespace-nowrap"
+              style={
+                drawerOpen
+                  ? { backgroundColor: 'var(--blue)', borderColor: 'var(--blue)', color: '#fff' }
+                  : { backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)', color: 'var(--muted)' }
+              }
+              aria-label={drawerOpen ? 'Close insights panel' : 'Open insights panel'}
+              aria-expanded={drawerOpen}
+            >
+              {drawerOpen ? <X className="w-3.5 h-3.5" /> : <Sparkles className="w-3.5 h-3.5" />}
+              Insights
+              {hasInsightsData && !drawerOpen && (
+                <span
+                  className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-[var(--blue)]"
+                  aria-hidden="true"
+                />
+              )}
             </button>
           </div>
         </div>
