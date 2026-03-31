@@ -17,8 +17,8 @@ import AnimatedBackground from '@/components/AnimatedBackground'
 import SearchResultsFeed from '@/components/SearchResultsFeed'
 import TweetCard from '@/components/TweetCard'
 import UserCard from '@/components/UserCard'
-import { AIInsights } from '@/components/InsightsPanel'
-import InsightsDrawer from '@/components/InsightsDrawer'
+import InsightsPanel, { AIInsights } from '@/components/InsightsPanel'
+import TrendsPanel from '@/components/TrendsPanel'
 import UserProfileModal from '@/components/UserProfileModal'
 
 export type ScoredTweet = Tweet & { sentiment: TweetSentiment }
@@ -100,10 +100,6 @@ export default function Dashboard() {
 
   // User profile modal
   const [modalUser, setModalUser] = useState<User | null>(null)
-
-  // Insights drawer
-  const [drawerOpen, setDrawerOpen] = useState(false)
-  const drawerToggleRef = useRef<HTMLButtonElement>(null)
 
   // Search query ref — used to ignore stale responses
   const activeSearchQueryRef = useRef<string>('')
@@ -198,7 +194,8 @@ export default function Dashboard() {
     setTweetSummaries({})
     setLoading((l) => ({ ...l, search: true }))
 
-    // Enhance query (best-effort — don't block on failure)
+    // Get signal-targeted query variants (best-effort — don't block on failure)
+    let signalQueries: string[] | null = null
     let queryToUse = rawQuery
     try {
       const enhRes = await fetch('/api/ai/enhance-query', {
@@ -208,7 +205,11 @@ export default function Dashboard() {
       })
       if (enhRes.ok) {
         const enhData = await enhRes.json()
-        if (enhData.enhanced && enhData.enhanced !== rawQuery) {
+        if (enhData.signal_queries) {
+          const { pain, requests, workarounds } = enhData.signal_queries
+          signalQueries = [pain, requests, workarounds].filter(Boolean)
+          setEnhancedQuery(`3 signal-targeted queries (pain · requests · workarounds)`)
+        } else if (enhData.enhanced && enhData.enhanced !== rawQuery) {
           queryToUse = enhData.enhanced
           setEnhancedQuery(enhData.enhanced)
         }
@@ -219,11 +220,10 @@ export default function Dashboard() {
 
     try {
       const hasUsername = state.username.trim().length > 0
-      let endpoint = '/api/desearch/x'
-      const body: Record<string, unknown> = {
-        query: queryToUse,
+
+      // Shared filter params (everything except the query itself)
+      const sharedParams: Record<string, unknown> = {
         sort: state.sort,
-        count: state.resultCount,
         startDate: state.startDate || undefined,
         endDate: state.endDate || undefined,
         lang: state.lang || undefined,
@@ -237,41 +237,95 @@ export default function Dashboard() {
         minLikes: state.minLikes || undefined,
       }
 
-      if (hasUsername) {
-        endpoint = '/api/desearch/x_user'
-        body.user = state.username
-        body.query = queryToUse
+      let allTweets: Tweet[] = []
+
+      if (signalQueries && !hasUsername) {
+        // Run all 3 signal queries in parallel, each at 1/3 of the configured count
+        const perQueryCount = Math.max(10, Math.round(state.resultCount / 3))
+        const fetches = signalQueries.map((q) =>
+          fetch('/api/desearch/x', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ...sharedParams, query: q, count: perQueryCount }),
+          }).then((r) => r.json()).catch(() => null)
+        )
+        const results = await Promise.all(fetches)
+
+        if (activeSearchQueryRef.current !== rawQuery) return
+
+        // Merge and deduplicate by tweet ID — preserve insertion order (pain-first)
+        const seen = new Set<string>()
+        for (const result of results) {
+          if (isValidSearchResult(result)) {
+            for (const tweet of result as Tweet[]) {
+              if (!seen.has(tweet.id)) {
+                seen.add(tweet.id)
+                allTweets.push(tweet)
+              }
+            }
+          }
+        }
+
+        // If all signal queries failed, fall back to the raw query
+        if (allTweets.length === 0) {
+          const fallback = await fetch('/api/desearch/x', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ...sharedParams, query: rawQuery, count: state.resultCount }),
+          })
+          const fallbackData = await fallback.json()
+          if (activeSearchQueryRef.current !== rawQuery) return
+          if (!fallback.ok || isApiError(fallbackData)) {
+            handleApiError(fallbackData, setSearchError)
+            setSearchResults([])
+            return
+          }
+          if (isValidSearchResult(fallbackData)) allTweets = fallbackData as Tweet[]
+        }
+      } else {
+        // User-scoped search or no signal queries — single request
+        const endpoint = hasUsername ? '/api/desearch/x_user' : '/api/desearch/x'
+        const body: Record<string, unknown> = {
+          ...sharedParams,
+          query: queryToUse,
+          count: state.resultCount,
+        }
+        if (hasUsername) {
+          body.user = state.username
+        }
+
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        })
+        const data = await res.json()
+
+        if (activeSearchQueryRef.current !== rawQuery) return
+
+        if (!res.ok || isApiError(data)) {
+          handleApiError(data, setSearchError)
+          setSearchResults([])
+          return
+        }
+
+        if (isValidSearchResult(data)) allTweets = data as Tweet[]
       }
 
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      })
-      const data = await res.json()
-
-      // Ignore if this search has been superseded by a newer one
       if (activeSearchQueryRef.current !== rawQuery) return
 
-      if (!res.ok || isApiError(data)) {
-        handleApiError(data, setSearchError)
-        setSearchResults([])
-        return
-      }
-
-      if (isValidSearchResult(data)) {
-        const scored = data.map((tweet: Tweet) => ({
+      if (allTweets.length > 0) {
+        const scored = allTweets.map((tweet: Tweet) => ({
           ...tweet,
           sentiment: analyzeTweet(tweet.text),
         })) as ScoredTweet[]
 
-        setSearchResults(data)
+        setSearchResults(allTweets)
         setScoredTweets(scored)
 
-        // Fire AI calls asynchronously — don't await, they update state independently
         if (activeSearchQueryRef.current === rawQuery) {
           fetchInsights(rawQuery, scored)
-          fetchTweetSummaries(data)
+          fetchTweetSummaries(allTweets)
         }
       } else {
         setSearchResults([])
@@ -509,15 +563,12 @@ export default function Dashboard() {
         onLoadRetweeters={() => doLoadRetweeters()}
         loading={!!activeLoadingEndpoint}
         activeEndpoint={activeLoadingEndpoint}
-        drawerOpen={drawerOpen}
-        onToggleDrawer={() => setDrawerOpen((o) => !o)}
-        hasInsightsData={scoredTweets.length > 0 || !!aiInsights || retweetersData.length > 0}
-        drawerToggleRef={drawerToggleRef}
       />
 
       <div className="p-4">
-        <div className="flex justify-center">
-          <div className="w-full max-w-3xl">
+        <div className="grid grid-cols-1 lg:grid-cols-[1fr_380px] gap-4">
+          {/* LEFT COLUMN — search feed only */}
+          <div className="space-y-4">
             <Panel
               title="Search Results"
               subtitle={
@@ -560,27 +611,81 @@ export default function Dashboard() {
               />
             </Panel>
           </div>
+
+          {/* RIGHT COLUMN */}
+          <div className="space-y-4">
+            {/* Trends & Word Cloud — top of right column */}
+            <Panel
+              title="Trends & Word Cloud"
+              subtitle={searchResults.length > 0 ? `${scoredTweets.length} posts analyzed` : undefined}
+            >
+              <TrendsPanel
+                tweets={scoredTweets.length > 0 ? scoredTweets : []}
+                searchQuery={lastSearchQuery}
+              />
+            </Panel>
+
+            {/* Business Opportunities */}
+            <Panel
+              title="Business Opportunities"
+              subtitle={
+                aiInsights
+                  ? `${aiInsights.opportunities.length} opportunities identified`
+                  : aiInsightsLoading
+                  ? 'Analyzing with AI...'
+                  : 'AI-powered opportunity detection'
+              }
+            >
+              <InsightsPanel
+                insights={aiInsights}
+                loading={aiInsightsLoading}
+                error={aiInsightsError}
+                tweetCount={scoredTweets.length}
+                searchQuery={lastSearchQuery}
+              />
+            </Panel>
+
+            {/* Retweeters */}
+            <Panel
+              title="Retweeters"
+              loading={loading.retweeters}
+              error={retweetersError}
+              onRetry={() => doLoadRetweeters()}
+              emptyMessage={state.postIdUrl ? undefined : 'Enter a post ID to see retweeters'}
+            >
+              <div>
+                {retweetersData.map((user) => (
+                  <UserCard
+                    key={user.id}
+                    user={user}
+                    compact
+                    onUsernameClick={handleUsernameClick}
+                  />
+                ))}
+                {retweetersCursor && (
+                  <button
+                    onClick={() => doLoadRetweeters(undefined, retweetersCursor ?? undefined)}
+                    disabled={loadingMore}
+                    className="w-full py-3 text-sm text-[#1d9bf0] hover:bg-[#1d9bf0]/10 transition-colors disabled:opacity-50"
+                  >
+                    {loadingMore ? 'Loading...' : 'Load More'}
+                  </button>
+                )}
+                {!retweetersCursor && retweetersData.length > 0 && (
+                  <div className="py-2 text-center text-xs text-[var(--muted)]">
+                    All retweeters loaded
+                  </div>
+                )}
+                {!state.postIdUrl && (
+                  <div className="flex items-center justify-center h-24 text-[var(--muted)] text-sm">
+                    Enter a post ID to load
+                  </div>
+                )}
+              </div>
+            </Panel>
+          </div>
         </div>
       </div>
-
-      {/* Insights slide-over drawer */}
-      <InsightsDrawer
-        open={drawerOpen}
-        onClose={() => setDrawerOpen(false)}
-        toggleButtonRef={drawerToggleRef}
-        scoredTweets={scoredTweets}
-        searchQuery={lastSearchQuery}
-        aiInsights={aiInsights}
-        aiInsightsLoading={aiInsightsLoading}
-        aiInsightsError={aiInsightsError}
-        retweetersData={retweetersData}
-        retweetersError={retweetersError}
-        retweetersCursor={retweetersCursor}
-        loadingMore={loadingMore}
-        loadingRetweeters={loading.retweeters}
-        onLoadMoreRetweeters={() => doLoadRetweeters(undefined, retweetersCursor ?? undefined)}
-        onUsernameClick={handleUsernameClick}
-      />
 
       {/* User profile modal */}
       {modalUser && (
